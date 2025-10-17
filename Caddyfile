@@ -1,0 +1,45 @@
+# Global options
+{
+	# Use local CA for automatic HTTPS
+	local_certs
+	# Disable admin API endpoint (optional, for security)
+	admin off
+}
+
+
+
+# All subdomains of newsbytesapp.test → host port 80
+*.newsbytesapp.test {
+	reverse_proxy host.docker.internal:80 {
+		header_up Host {host}
+		header_up X-Real-IP {remote}
+		header_up X-Forwarded-For {remote}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}
+
+# Wildcard catch-all for other .test domains
+# This allows dynamic addition of new domains without editing Caddyfile
+# Format: subdomain.test:port or domain.test:port
+
+
+
+
+
+
+# Example usage: Add "api.myapp.test:3000" to /etc/hosts, then visit https://api.myapp.test:3000
+*.test {
+	# Proxy to host port 80 by default
+	# To use custom ports, add specific entries above
+	reverse_proxy host.docker.internal:80 {
+		header_up Host {host}
+		header_up X-Real-IP {remote}
+		header_up X-Forwarded-For {remote}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}
+
+# Catch-all for unknown domains (returns 404)
+:80, :443 {
+	respond "404 - Domain not configured" 404
+}

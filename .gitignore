@@ -1,0 +1,32 @@
+# Generated certificates
+*.crt
+*.pem
+*.key
+caddy-root.crt
+
+# Docker volumes
+.docker/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+.tmp/
+temp/
+
+# Environment files
+.env
+.env.local
+.env.*.local

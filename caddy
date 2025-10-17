@@ -1,0 +1,410 @@
+#!/bin/bash
+
+# Caddy Local HTTPS - CLI for local HTTPS reverse proxy
+# Usage: ./caddy <command> [arguments]
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Script directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+CADDYFILE="$SCRIPT_DIR/Caddyfile"
+COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
+CONTAINER_NAME="caddy-local-https"
+
+# Helper functions
+error() {
+    echo -e "${RED}Error:${NC} $1" >&2
+    exit 1
+}
+
+success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+warning() {
+    echo -e "${YELLOW}!${NC} $1"
+}
+
+info() {
+    echo -e "${BLUE}→${NC} $1"
+}
+
+# Check if running in project directory
+check_environment() {
+    if [[ ! -f "$CADDYFILE" ]] || [[ ! -f "$COMPOSE_FILE" ]]; then
+        error "Caddyfile or docker-compose.yml not found. Run this script from the project directory."
+    fi
+}
+
+# Get container status
+get_status() {
+    docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "not found"
+}
+
+# Command: start
+cmd_start() {
+    check_environment
+    info "Starting Caddy HTTPS proxy..."
+    docker-compose -f "$COMPOSE_FILE" up -d
+    success "Caddy is running on https://localhost:443"
+
+    if ! grep -q "caddy-root.crt" /usr/local/share/ca-certificates/ 2>/dev/null; then
+        warning "CA certificate not installed. Run: sudo ./caddy trust"
+    fi
+}
+
+# Command: stop
+cmd_stop() {
+    check_environment
+    info "Stopping Caddy HTTPS proxy..."
+    docker-compose -f "$COMPOSE_FILE" stop
+    success "Caddy stopped"
+}
+
+# Command: restart
+cmd_restart() {
+    check_environment
+    info "Restarting Caddy HTTPS proxy..."
+    docker-compose -f "$COMPOSE_FILE" restart
+    success "Caddy restarted"
+}
+
+# Command: status
+cmd_status() {
+    check_environment
+    local status=$(get_status)
+
+    echo "Caddy Container Status: $status"
+
+    if [[ "$status" == "running" ]]; then
+        echo ""
+        docker-compose -f "$COMPOSE_FILE" ps
+        echo ""
+        success "Caddy is running"
+    else
+        warning "Caddy is not running. Start it with: ./caddy start"
+    fi
+}
+
+# Command: logs
+cmd_logs() {
+    check_environment
+    docker-compose -f "$COMPOSE_FILE" logs -f caddy
+}
+
+# Command: links
+cmd_links() {
+    check_environment
+
+    echo "Configured domains in Caddyfile:"
+    echo ""
+
+    # Extract domain configurations (excluding wildcards and catch-all)
+    grep -E "^[a-zA-Z0-9\-]+(\.[a-zA-Z0-9\-]+)+ \{" "$CADDYFILE" | sed 's/ {//' | while read domain; do
+        # Check if in /etc/hosts
+        if grep -q "127.0.0.1[[:space:]]*$domain" /etc/hosts 2>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} https://$domain"
+        else
+            echo -e "  ${YELLOW}!${NC} https://$domain (not in /etc/hosts)"
+        fi
+    done
+
+    echo ""
+    info "Wildcard domains:"
+    grep -E "^\*\.[a-zA-Z0-9\-]+(\.[a-zA-Z0-9\-]+)* \{" "$CADDYFILE" | sed 's/ {//' | while read domain; do
+        echo "    $domain"
+    done
+}
+
+# Command: link
+cmd_link() {
+    check_environment
+
+    local domain="$1"
+    local port="${2:-80}"
+
+    if [[ -z "$domain" ]]; then
+        error "Usage: ./caddy link <domain> [port]\nExample: ./caddy link myapp.test 3000"
+    fi
+
+    # Validate domain format (supports subdomains like www.myapp.test)
+    if [[ ! "$domain" =~ ^[a-zA-Z0-9\-]+(\.[a-zA-Z0-9\-]+)+$ ]]; then
+        error "Invalid domain format. Use: myapp.test or subdomain.myapp.test"
+    fi
+
+    # Check if domain already exists
+    if grep -q "^$domain {" "$CADDYFILE"; then
+        warning "Domain $domain already exists in Caddyfile"
+        return 0
+    fi
+
+    info "Adding $domain → host.docker.internal:$port"
+
+    # Find the line number before the wildcard catch-all
+    local insert_line=$(grep -n "^\*\.test {" "$CADDYFILE" | cut -d: -f1)
+
+    if [[ -z "$insert_line" ]]; then
+        error "Could not find wildcard catch-all in Caddyfile"
+    fi
+
+    # Create the new domain block
+    local new_block="# Specific site: $domain → host port $port
+$domain {
+	reverse_proxy host.docker.internal:$port {
+		header_up Host {host}
+		header_up X-Real-IP {remote}
+		header_up X-Forwarded-For {remote}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}
+
+"
+
+    # Insert before the wildcard
+    local temp_file=$(mktemp)
+    head -n $((insert_line - 2)) "$CADDYFILE" > "$temp_file"
+    echo "$new_block" >> "$temp_file"
+    tail -n +$((insert_line - 1)) "$CADDYFILE" >> "$temp_file"
+    mv "$temp_file" "$CADDYFILE"
+
+    success "Added $domain to Caddyfile"
+
+    # Add to /etc/hosts
+    if grep -q "127.0.0.1[[:space:]]*$domain" /etc/hosts 2>/dev/null; then
+        info "Domain already in /etc/hosts"
+    else
+        info "Adding $domain to /etc/hosts (requires sudo)"
+        echo "127.0.0.1  $domain" | sudo tee -a /etc/hosts > /dev/null
+        success "Added $domain to /etc/hosts"
+    fi
+
+    # Restart Caddy
+    info "Restarting Caddy..."
+    docker-compose -f "$COMPOSE_FILE" restart
+
+    success "Domain linked! Visit https://$domain"
+
+    # Auto-trust CA certificate if not already done
+    echo ""
+    if [[ ! -f "$SCRIPT_DIR/caddy-root.crt" ]] || ! grep -q "caddy-root.crt" /usr/local/share/ca-certificates/ 2>/dev/null; then
+        warning "CA certificate not yet trusted. Installing now..."
+
+        local status=$(get_status)
+        if [[ "$status" == "running" ]]; then
+            info "Extracting Caddy CA certificate..."
+            docker exec "$CONTAINER_NAME" cat /data/caddy/pki/authorities/local/root.crt > "$SCRIPT_DIR/caddy-root.crt" 2>/dev/null
+
+            if [[ -f "$SCRIPT_DIR/caddy-root.crt" ]]; then
+                success "Certificate saved to caddy-root.crt"
+
+                info "Installing certificate to system (requires sudo)..."
+                sudo cp "$SCRIPT_DIR/caddy-root.crt" /usr/local/share/ca-certificates/
+                sudo update-ca-certificates
+
+                success "System certificate installed!"
+            fi
+        fi
+    else
+        info "System CA certificate already installed"
+    fi
+
+    # Always print browser instructions
+    echo ""
+    warning "To avoid browser SSL warnings, import the certificate to your browser:"
+    echo ""
+    echo -e "${BLUE}Chrome/Chromium:${NC}"
+    echo "  1. Go to: chrome://settings/certificates"
+    echo "  2. Click 'Authorities' tab"
+    echo "  3. Click 'Import' and select: $SCRIPT_DIR/caddy-root.crt"
+    echo "  4. Check 'Trust this certificate for identifying websites'"
+    echo ""
+    echo -e "${BLUE}Firefox:${NC}"
+    echo "  1. Go to: about:preferences#privacy"
+    echo "  2. Scroll to 'Certificates' → Click 'View Certificates'"
+    echo "  3. Click 'Authorities' tab → 'Import'"
+    echo "  4. Select: $SCRIPT_DIR/caddy-root.crt"
+    echo "  5. Check 'Trust this CA to identify websites'"
+    echo ""
+    info "After importing, restart your browser"
+}
+
+# Command: unlink
+cmd_unlink() {
+    check_environment
+
+    local domain="$1"
+
+    if [[ -z "$domain" ]]; then
+        error "Usage: ./caddy unlink <domain>\nExample: ./caddy unlink myapp.test"
+    fi
+
+    # Check if domain exists
+    if ! grep -q "^$domain {" "$CADDYFILE"; then
+        error "Domain $domain not found in Caddyfile"
+    fi
+
+    info "Removing $domain from Caddyfile..."
+
+    # Remove the domain block (comment line + domain block until closing brace)
+    local temp_file=$(mktemp)
+    awk "
+        /^# Specific site: $domain/ { skip=1; next }
+        skip && /^$domain \{/ { in_block=1; next }
+        skip && in_block && /^\}/ { skip=0; in_block=0; next }
+        skip && in_block { next }
+        !skip { print }
+    " "$CADDYFILE" > "$temp_file"
+
+    mv "$temp_file" "$CADDYFILE"
+    success "Removed $domain from Caddyfile"
+
+    # Remove from /etc/hosts
+    if grep -q "127.0.0.1[[:space:]]*$domain" /etc/hosts 2>/dev/null; then
+        info "Removing $domain from /etc/hosts (requires sudo)"
+        sudo sed -i "/127.0.0.1[[:space:]]*$domain/d" /etc/hosts
+        success "Removed $domain from /etc/hosts"
+    fi
+
+    # Restart Caddy
+    info "Restarting Caddy..."
+    docker-compose -f "$COMPOSE_FILE" restart
+
+    success "Domain unlinked!"
+}
+
+# Command: trust
+cmd_trust() {
+    check_environment
+
+    local status=$(get_status)
+    if [[ "$status" != "running" ]]; then
+        error "Caddy is not running. Start it first with: ./caddy start"
+    fi
+
+    info "Extracting Caddy CA certificate..."
+    docker exec "$CONTAINER_NAME" cat /data/caddy/pki/authorities/local/root.crt > "$SCRIPT_DIR/caddy-root.crt"
+    success "Certificate saved to caddy-root.crt"
+
+    info "Installing certificate to system (requires sudo)..."
+    sudo cp "$SCRIPT_DIR/caddy-root.crt" /usr/local/share/ca-certificates/
+    sudo update-ca-certificates
+
+    success "CA certificate installed!"
+    warning "You may need to import caddy-root.crt to your browser manually"
+    info "Firefox: Settings → Privacy & Security → Certificates → View Certificates → Import"
+    info "Chrome: Settings → Privacy and security → Security → Manage certificates → Authorities → Import"
+}
+
+# Command: secure (already secured by default)
+cmd_secure() {
+    info "All domains are automatically secured with HTTPS by Caddy"
+    info "To trust the certificates, run: sudo ./caddy trust"
+}
+
+# Command: help
+cmd_help() {
+    cat << EOF
+Caddy Local HTTPS - CLI for local HTTPS reverse proxy
+
+Usage: ./caddy <command> [arguments]
+
+Commands:
+  start                 Start the Caddy HTTPS proxy
+  stop                  Stop the Caddy HTTPS proxy
+  restart               Restart the Caddy HTTPS proxy
+  status                Show Caddy container status
+  logs                  View Caddy logs (follow mode)
+
+  link <domain> [port]  Add a new domain (default port: 80)
+                        Example: ./caddy link myapp.test
+                        Example: ./caddy link api.test 3000
+
+  unlink <domain>       Remove a domain
+                        Example: ./caddy unlink myapp.test
+
+  links                 List all configured domains
+
+  trust                 Extract and install CA certificate
+                        (Required for browsers to trust HTTPS)
+
+  secure <domain>       Show HTTPS status (all domains auto-secured)
+
+  help                  Show this help message
+
+Examples:
+  # Start the proxy
+  ./caddy start
+
+  # Add a new site on Apache (port 80)
+  ./caddy link myproject.test
+
+  # Add a Node.js app on port 3000
+  ./caddy link nodeapp.test 3000
+
+  # Trust certificates
+  sudo ./caddy trust
+
+  # View all linked sites
+  ./caddy links
+
+  # Remove a site
+  ./caddy unlink myproject.test
+
+For more information, see README.md
+EOF
+}
+
+# Main command router
+main() {
+    local command="${1:-help}"
+    shift || true
+
+    case "$command" in
+        start)
+            cmd_start "$@"
+            ;;
+        stop)
+            cmd_stop "$@"
+            ;;
+        restart)
+            cmd_restart "$@"
+            ;;
+        status)
+            cmd_status "$@"
+            ;;
+        logs)
+            cmd_logs "$@"
+            ;;
+        links)
+            cmd_links "$@"
+            ;;
+        link)
+            cmd_link "$@"
+            ;;
+        unlink)
+            cmd_unlink "$@"
+            ;;
+        trust)
+            cmd_trust "$@"
+            ;;
+        secure)
+            cmd_secure "$@"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        *)
+            error "Unknown command: $command\n\nRun './caddy help' for usage information"
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"

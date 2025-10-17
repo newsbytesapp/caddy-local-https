@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy-local-https
+    restart: unless-stopped
+    ports:
+      # Port 80 removed - Apache handles HTTP
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    extra_hosts:
+      # Linux requires explicit mapping for host.docker.internal
+      - "host.docker.internal:host-gateway"
+    networks:
+      - caddy-network
+
+networks:
+  caddy-network:
+    driver: bridge
+
+volumes:
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local
